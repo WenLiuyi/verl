@@ -870,7 +870,7 @@ class RayPPOTrainer:
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
-            logger.log(data=val_metrics, step=self.global_steps)
+            logger.log(data=val_metrics, step=self.global_steps, batch=None, tokenizer=self.tokenizer)
             if self.config.trainer.get("val_only", False):
                 return
 

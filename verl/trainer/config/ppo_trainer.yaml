@@ -221,7 +221,7 @@ trainer:
   total_training_steps: null
   project_name: verl_examples
   experiment_name: gsm8k
-  logger: [ 'console', 'wandb' ]
+  logger: [ 'console', 'wandb', 'rlloggingboard' ]
   log_val_generations: 0
   rollout_data_dir: null # directory for logging the rollout data, no dump if null
   validation_data_dir: null # directory for logging the validation data, no dump if null
@@ -237,6 +237,7 @@ trainer:
   default_hdfs_dir: null
   del_local_ckpt_after_load: False
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  rl_logging_board_dir: ~/logs/rl_logging_board
   max_actor_ckpt_to_keep: null
   max_critic_ckpt_to_keep: null
   # The timeout for ray worker group to wait for the register center to be ready

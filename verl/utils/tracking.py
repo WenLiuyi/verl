@@ -21,9 +21,13 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Dict, List, Union
 
+import subprocess
+import os
+import signal
+import time
 
 class Tracking:
-    supported_backend = ["wandb", "mlflow", "swanlab", "vemlp_wandb", "tensorboard", "console"]
+    supported_backend = ["wandb", "mlflow", "swanlab", "vemlp_wandb", "tensorboard", "console", "rlloggingboard"]
 
     def __init__(self, project_name, experiment_name, default_backend: Union[str, List[str]] = "console", config=None):
         if isinstance(default_backend, str):
@@ -111,10 +115,19 @@ class Tracking:
             self.console_logger = LocalLogger(print_to_console=True)
             self.logger["console"] = self.console_logger
 
-    def log(self, data, step, backend=None):
+        if "rlloggingboard" in default_backend:
+            self.logger["rlloggingboard"] = _RLLoggingboardAdapter(
+                config.trainer.rl_logging_board_dir, 
+                project_name, 
+                experiment_name)
+            rl_backend=_RLLoggingBoardBackend()
+            rl_backend.start()
+
+
+    def log(self, data, step, batch, backend=None, tokenizer=None):
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
-                logger_instance.log(data=data, step=step)
+                logger_instance.log(data=data, step=step, batch=batch, tokenizer=tokenizer)
 
     def __del__(self):
         if "wandb" in self.logger:
@@ -138,7 +151,7 @@ class _TensorboardAdapter:
         print(f"Saving tensorboard log to {tensorboard_dir}.")
         self.writer = SummaryWriter(tensorboard_dir)
 
-    def log(self, data, step):
+    def log(self, data, step, batch=None):
         for key in data:
             self.writer.add_scalar(key, data[key], step)
 
@@ -269,3 +282,133 @@ class ValidationGenerationsLogger:
                 mlflow.log_artifact(validation_gen_step_file)
         except Exception as e:
             print(f"WARNING: save validation generation file to mlflow failed with error {e}")
+
+class _RLLoggingboardAdapter:
+    from verl import DataProto
+    def __init__(
+        self,
+        root_log_dir: str,
+        project_name: str,
+        experiment_name: str
+    ):
+        self.save_path = os.path.join(
+            root_log_dir, 
+            project_name, 
+            experiment_name
+        )
+        try:
+            os.makedirs(self.save_path, exist_ok=True)
+        except:
+            pass
+
+    def log(
+        self,
+        data: dict,
+        step: int,
+        batch: DataProto,
+        *args,
+        **kwargs
+    ):
+        import json
+        if 'tokenizer' not in kwargs:
+            raise ValueError("Please provide a tokenizer.")
+        
+        tokenizer = kwargs['tokenizer']
+        with open(os.path.join(self.save_path, f"rollout_data_rank0.jsonl"), "a") as f:       
+            for i in range(len(batch)):
+                data_item = batch[i]
+                prompt_ids = data_item.batch['prompts']
+                prompt_length = prompt_ids.shape[-1]
+
+                valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
+                valid_prompt_ids = prompt_ids[-valid_prompt_length:]
+
+                response_ids = data_item.batch['responses']
+                valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
+                valid_response_ids = response_ids[:valid_response_length]
+
+                prompt_str = tokenizer.decode(valid_prompt_ids)
+                response_str = tokenizer.decode(valid_response_ids)
+                response_tokens = [tokenizer.decode([token]) for token in valid_response_ids]
+                cur_sample = {
+                    "step": step,
+                    "prompt": prompt_str,
+                    "response": response_str,
+                    "response_tokens": response_tokens,
+                    "logprobs": data_item.batch['old_log_probs'][:valid_response_length].cpu().tolist(),
+                    "ref_logprobs": data_item.batch['ref_log_prob'][:valid_response_length].cpu().tolist(),
+                    #"values": data_item.batch['values'][:valid_response_length].cpu().tolist(),
+                    "token_rewards": data_item.batch['token_level_rewards'][:valid_response_length].cpu().tolist(),     # with KL penalty
+                    "reward": data_item.batch['token_level_scores'][:valid_response_length].cpu().sum().item(),         # without KL penalty"
+                }
+                
+                if "ground_truth" in data_item.non_tensor_batch['reward_model']:
+                    cur_sample["ground_truth"] = data_item.non_tensor_batch['reward_model']["ground_truth"]
+                
+                f.write(f"{json.dumps(cur_sample, ensure_ascii=False)}\n")
+
+    def finish(self):
+        self.writer.close()
+
+class _RLLoggingBoardBackend:
+    def __init__(self, script_path="/logger/rl_logging_board.py", port=8081, headless=True, quiet=True):
+        """
+        初始化 RLLoggingBoard 后台控制类
+
+        :param script_path: RLLoggingBoard 的脚本路径
+        :param port: Streamlit 运行端口
+        :param headless: 是否为无头模式（不打开浏览器）
+        :param quiet: 是否静默运行（不输出 Streamlit 日志）
+        """
+        self.script_path = script_path
+        self.port = port
+        self.headless = headless
+        self.quiet = quiet
+        self.proc = None
+
+    def _set_streamlit_headless(self):
+        """设置 ~/.streamlit/config.toml 含主题样式和服务配置"""
+        config_dir = os.path.expanduser("~/.streamlit")
+        os.makedirs(config_dir, exist_ok=True)
+        config_path = os.path.join(config_dir, "config.toml")
+        with open(config_path, "w") as f:
+            f.write(
+                f"""
+[server]
+headless = {str(self.headless).lower()}
+browser.gatherUsageStats = false
+websocket_ping_timeout = 300
+port = {self.port}
+
+[theme]
+base = "dark"
+backgroundColor = "#171719"
+secondaryBackgroundColor = "#202025"
+primaryColor = "#AAAAAD"
+font = "serif"
+textColor = "#ceced2"
+                """.strip()
+            )
+
+    def start(self):
+        """启动 RLLoggingBoard"""
+        self._set_streamlit_headless()
+        cmd = ["streamlit", "run", self.script_path, "--server.port", str(self.port)]
+
+        stdout = subprocess.DEVNULL if self.quiet else None
+
+        self.proc = subprocess.Popen(
+            cmd,
+            stdout=stdout,
+            stderr=subprocess.STDOUT,
+            preexec_fn=os.setsid
+        )
+        time.sleep(2)
+        print(f"[RLLoggingBoard] 已启动，监听端口 {self.port}")
+
+    def stop(self):
+        """关闭 RLLoggingBoard"""
+        if self.proc:
+            os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+            print("[RLLoggingBoard] 已关闭")
+            self.proc = None

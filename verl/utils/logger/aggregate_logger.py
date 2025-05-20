@@ -38,7 +38,7 @@ class LocalLogger:
     def flush(self):
         pass
 
-    def log(self, data, step):
+    def log(self, data, step, batch=None, tokenizer=None):
         if self.print_to_console:
             print(concat_dict_to_str(data, step=step), flush=True)
 
